@@ -286,8 +286,10 @@ AI Social Media Agent
 import os
 import random
 import requests
+from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
+import replicate
 
 load_dotenv()
 
@@ -427,6 +429,74 @@ Rules:
 
 
 # ============================================================
+# REPLICATE (IMAGE GENERATION)
+# ============================================================
+
+DEFAULT_REPLICATE_MODEL = (
+    "sundai-club/pawse:6a15ed7ee6d09ce510934777933c9dd3f2a85f2385e7327e90bd92959b846712"
+)
+
+
+class ImageGenerator:
+    def __init__(self, model: str | None = None):
+        token = os.getenv("REPLICATE_API_TOKEN")
+        if not token:
+            raise ValueError("Missing Replicate credentials (REPLICATE_API_TOKEN)")
+        # Replicate's SDK uses this env var.
+        os.environ["REPLICATE_API_TOKEN"] = token
+        self.model = model or os.getenv("REPLICATE_MODEL", DEFAULT_REPLICATE_MODEL)
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        out_dir: str | Path = "outputs",
+        filename: str | None = None,
+        **overrides,
+    ):
+        """
+        Returns: (image_url, saved_path)
+        """
+        if not prompt or not prompt.strip():
+            raise ValueError("prompt is required")
+
+        inputs = {
+            "prompt": prompt,
+            "model": "dev",
+            "go_fast": False,
+            "lora_scale": 1,
+            "megapixels": "1",
+            "num_outputs": 1,
+            "aspect_ratio": "1:1",
+            "output_format": "webp",
+            "guidance_scale": 3,
+            "output_quality": 80,
+            "prompt_strength": 0.8,
+            "extra_lora_scale": 1,
+            "num_inference_steps": 28,
+        }
+        inputs.update({k: v for k, v in overrides.items() if v is not None})
+
+        output = replicate.run(self.model, input=inputs)
+        if not output:
+            raise RuntimeError("Replicate returned no outputs")
+
+        file_obj = output[0]
+        image_url = getattr(file_obj, "url", None)
+
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if not filename:
+            filename = "image.webp"
+        out_path = out_dir / filename
+
+        # Replicate returns a file-like object with .read()
+        out_path.write_bytes(file_obj.read())
+        return image_url, str(out_path)
+
+
+# ============================================================
 # MASTODON CLIENT
 # ============================================================
 
@@ -438,8 +508,40 @@ class MastodonClient:
             raise ValueError("Missing Mastodon credentials")
         self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
-    def post_status(self, text):
-        r = requests.post(f"{self.base}/api/v1/statuses", headers=self.headers, json={"status": text})
+    def upload_media(self, file_path, description=None):
+        """Upload a media file to Mastodon and return the media ID."""
+        url = f"{self.base}/api/v2/media"
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        with open(file_path, "rb") as f:
+            files = {"file": (Path(file_path).name, f, self._get_content_type(file_path))}
+            data = {}
+            if description:
+                data["description"] = description
+
+            r = requests.post(url, headers=headers, files=files, data=data)
+            r.raise_for_status()
+            return r.json()["id"]
+
+    def _get_content_type(self, file_path):
+        """Determine content type from file extension."""
+        ext = Path(file_path).suffix.lower()
+        content_types = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }
+        return content_types.get(ext, "image/jpeg")
+
+    def post_status(self, text, media_ids=None):
+        """Post a status, optionally with media attachments."""
+        payload = {"status": text}
+        if media_ids:
+            payload["media_ids"] = media_ids if isinstance(media_ids, list) else [media_ids]
+
+        r = requests.post(f"{self.base}/api/v1/statuses", headers=self.headers, json=payload)
         r.raise_for_status()
         return r.json()
 
@@ -478,11 +580,17 @@ def main():
     docs = notion.get_all_documents()
     generator = SocialMediaGenerator()
     mastodon = MastodonClient()
+    img_generator = None
+
+    try:
+        img_generator = ImageGenerator()
+    except ValueError:
+        print("⚠️ Replicate not configured - image generation disabled")
 
     while True:
-        print("\n1. New post\n2. New post (topic)\n3. Reply to posts\n4. Exit")
+        print("\n1. New post\n2. New post (topic)\n3. Reply to posts\n4. Generate image\n5. Exit")
         choice = input("> ").strip()
-        if choice == "4":
+        if choice == "5":
             break
 
         context = "\n\n".join(random.sample(docs, k=min(2, len(docs))))
@@ -491,8 +599,33 @@ def main():
             topic = input("Topic: ").strip() if choice == "2" else None
             post = generator.generate_post(context, topic)
             print("\nPREVIEW:\n", post)
-            if input("\nPost? (y/n): ").lower() == "y":
-                mastodon.post_status(post)
+
+            media_ids = None
+            if img_generator and input("\nGenerate image for this post? (y/n): ").lower() == "y":
+                try:
+                    print("\n🖼️ Generating image...")
+                    # Use the post text as the image prompt
+                    image_prompt = post[:200]  # Use first 200 chars as prompt
+                    url, saved = img_generator.generate_image(
+                        image_prompt,
+                        out_dir="outputs",
+                        filename=f"post_{len(post)}.webp"
+                    )
+                    print(f"✓ Image generated: {saved}")
+                    if url:
+                        print(f"URL: {url}")
+
+                    if input("Upload image to Mastodon? (y/n): ").lower() == "y":
+                        media_id = mastodon.upload_media(saved, description=post[:500])
+                        media_ids = [media_id]
+                        print("✓ Image uploaded to Mastodon")
+                except Exception as e:
+                    print(f"❌ Image generation/upload failed: {e}")
+                    if input("Post text without image? (y/n): ").lower() != "y":
+                        continue
+
+            if input("\nPost to Mastodon? (y/n): ").lower() == "y":
+                mastodon.post_status(post, media_ids=media_ids)
                 print("✓ Posted")
 
         elif choice == "3":
@@ -511,6 +644,35 @@ def main():
                         print("✓ Reply posted")
             else:
                 print(f"⚠️ This Mastodon instance does not allow hashtag timelines. Replies skipped.")
+
+        elif choice == "4":
+            if not img_generator:
+                print("❌ Image generation not available. Check REPLICATE_API_TOKEN in .env")
+                continue
+
+            prompt = input("Image prompt: ").strip()
+            filename = input("Filename (Enter for image.webp): ").strip() or "image.webp"
+            try:
+                url, saved = img_generator.generate_image(prompt, out_dir="outputs", filename=filename)
+                print("\nIMAGE GENERATED")
+                if url:
+                    print("URL:", url)
+                print("Saved to:", saved)
+
+                if input("\nPost image to Mastodon? (y/n): ").lower() == "y":
+                    description = input("Image description (alt text, Enter to skip): ").strip() or None
+                    media_id = mastodon.upload_media(saved, description=description)
+                    print("✓ Image uploaded to Mastodon")
+
+                    if input("Post status with image? (y/n): ").lower() == "y":
+                        status_text = input("Status text: ").strip()
+                        if status_text:
+                            mastodon.post_status(status_text, media_ids=[media_id])
+                            print("✓ Posted to Mastodon")
+                        else:
+                            print("⚠️ No status text provided, image uploaded but not posted")
+            except Exception as e:
+                print(f"❌ Image generation failed: {e}")
 
 
 if __name__ == "__main__":
